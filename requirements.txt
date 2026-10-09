@@ -1,0 +1,6 @@
+PyQt6
+PyAudioWPatch
+soundfile
+numpy
+lameenc
+keyboard

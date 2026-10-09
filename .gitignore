@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Distribution / Packaging
+build/
+dist/
+*.spec
+*.exe
+
+# User Settings
+settings.json
+QuickAudioRecorder.log*
+
+# Local icon verification previews
+*_preview.png
+exe_icon_check.png
+
+# IDE
+.vscode/
+.idea/

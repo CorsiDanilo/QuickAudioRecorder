@@ -1,0 +1,62 @@
+# Contributing
+
+Thanks for taking the time to look at this. A few notes before you send a PR, these help me review faster and keep the tool from drifting away from what it's meant to be.
+
+## Before you start
+
+**For bug fixes and small improvements:** just send the PR.
+
+**For new features or larger changes:** please open an issue first so we can talk about it. The tool is intentionally minimalist, and not every feature is a good fit. Better to find out before you write the code than after.
+
+A few things that are likely out of scope:
+- Heavy dependencies for niche use cases
+- Anything that adds significant runtime overhead
+- Features that meaningfully expand the UI beyond the current tray + settings dialog
+
+If in doubt, open an issue and ask.
+
+## Pull request checklist
+
+- One topic per PR. If your branch fixes a bug and adds a feature and refactors a module, please split it.
+- Keep the diff focused. Reformatting unrelated files makes review much harder.
+- Test it manually on Windows. Describe what you tested in the PR description (which mode, which hotkey, which output settings).
+- If you changed the UI, include a screenshot or short GIF.
+- If you added a dependency, mention why it's necessary.
+
+## Using AI tools
+
+Codex, Claude Code, Copilot, Cursor aree all fine. But please:
+1. Mention it in the PR description.
+2. Confirm you actually ran the code and tested it yourself.
+3. Read the diff before submitting. If you can't explain what a part of your PR does, I probably shouldn't merge it.
+
+AI-generated PRs are not rejected on principle, but they tend to over-engineer and add code that isn't needed. Trim before you submit.
+
+## Development setup
+
+```bash
+pip install -r requirements.txt
+python main.py
+```
+
+For the standalone build:
+
+```bash
+pip install -r requirements.txt pyinstaller
+pyinstaller --noconsole --onefile --icon=app_icon.ico --add-data "app_icon.ico;." --name QuickAudioRecorder main.py
+```
+
+## Review timeline
+
+This is a side project, so reviews can take a few days to a week. If a PR has been sitting for two weeks without a response, feel free to ping it.
+
+## Reporting bugs
+
+Open an issue with:
+- Your Windows version
+- What you did
+- What you expected
+- What happened instead
+- Any error output (from the console if you ran it from source)
+
+Thanks for contributing.
