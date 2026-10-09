@@ -138,6 +138,7 @@ class RegressionTests(unittest.TestCase):
         )
         self.assertIn("pip install -r requirements.txt", workflow)
         self.assertIn("pyinstaller", workflow.lower())
+        self.assertIn('      - "*.*.*"', workflow)
 
     def test_logging_uses_daily_rotation_and_seven_backups(self):
         import logging
