@@ -145,6 +145,7 @@ class SettingsWindow(QMainWindow):
         
         self.combo_fmt = QComboBox()
         self.combo_fmt.addItems(["MP3", "WAV"])
+        self.combo_fmt.currentTextChanged.connect(self._update_source_wav_option)
         
         layout_out.addRow("Folder:", layout_folder_inner)
         layout_out.addRow("Format:", self.combo_fmt)
@@ -175,6 +176,10 @@ class SettingsWindow(QMainWindow):
         self.chk_normalize = QCheckBox("Normalize Audio (Apply first)")
         self.chk_clipboard = QCheckBox("Copy File to Clipboard")
         self.chk_delete = QCheckBox("Delete after Copy (Move to Temp)")
+        self.chk_keep_source_wav = QCheckBox("Keep original WAV source files")
+        self.chk_keep_source_wav.setToolTip(
+            "Keep the uncompressed microphone and system audio WAV files when the output format is MP3."
+        )
         self.chk_delete.setToolTip("Moves the file to the system temp folder before copying, keeping your output folder clean.")
         self.chk_delete.setEnabled(False)
         self.chk_clipboard.toggled.connect(lambda c: self.chk_delete.setEnabled(c))
@@ -182,6 +187,7 @@ class SettingsWindow(QMainWindow):
         layout_post.addWidget(self.chk_normalize)
         layout_post.addWidget(self.chk_clipboard)
         layout_post.addWidget(self.chk_delete)
+        layout_post.addWidget(self.chk_keep_source_wav)
         group_post.setLayout(layout_post)
         layout.addWidget(group_post)
 
@@ -234,6 +240,10 @@ class SettingsWindow(QMainWindow):
         if folder:
             self.lbl_folder.setText(folder)
 
+    def _update_source_wav_option(self, output_format=None):
+        is_mp3 = (output_format or self.combo_fmt.currentText()) == "MP3"
+        self.chk_keep_source_wav.setEnabled(is_mp3)
+
     def browse_log_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Log Folder", options=QFileDialog.Option.DontUseNativeDialog)
         if folder:
@@ -267,7 +277,11 @@ class SettingsWindow(QMainWindow):
                 self.chk_normalize.setChecked(data.get("normalize", False))
                 self.chk_clipboard.setChecked(data.get("clipboard", False))
                 self.chk_delete.setChecked(data.get("delete_after", False))
+                self.chk_keep_source_wav.setChecked(
+                    data.get("keep_source_wav", False)
+                )
                 self.chk_delete.setEnabled(self.chk_clipboard.isChecked())
+                self._update_source_wav_option()
 
                 self.hk_mic.setText(data.get("hk_mic", ""))
                 self.hk_loop.setText(data.get("hk_loop", ""))
@@ -299,6 +313,7 @@ class SettingsWindow(QMainWindow):
             "normalize": self.chk_normalize.isChecked(),
             "clipboard": self.chk_clipboard.isChecked(),
             "delete_after": self.chk_delete.isChecked(),
+            "keep_source_wav": self.chk_keep_source_wav.isChecked(),
             "hk_mic": self.hk_mic.text(),
             "hk_loop": self.hk_loop.text(),
             "hk_both": self.hk_both.text(),
@@ -475,6 +490,7 @@ class TrayApplication(QObject):
             normalize=settings['normalize'],
             on_finish_callback=finish_callback,
             loopback_id=target_loopback_id,
+            keep_source_wav=settings['keep_source_wav'],
         )
         self.recorder.start()
         self.action_record_mic.setEnabled(False)

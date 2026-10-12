@@ -251,7 +251,8 @@ class AudioRecorder(threading.Thread):
     Orchestrates recording from Microphone, Loopback, or Both.
     """
     def __init__(self, mic_id, source_mode, output_folder, output_format="mp3",
-                 normalize=False, on_finish_callback=None, loopback_id=None):
+                 normalize=False, on_finish_callback=None, loopback_id=None,
+                 keep_source_wav=False):
         super().__init__()
         self.mic_id = mic_id
         self.source_mode = source_mode # "mic", "loopback", "both"
@@ -260,6 +261,7 @@ class AudioRecorder(threading.Thread):
         self.normalize = normalize
         self.callback = on_finish_callback
         self.loopback_id = loopback_id
+        self.keep_source_wav = keep_source_wav
         
         self.recording = False
         self.stop_event = threading.Event()
@@ -439,7 +441,12 @@ class AudioRecorder(threading.Thread):
                     logger.exception("Failed to terminate audio backend")
                 self.audio = None
             if self.error_message is None:
-                self._finalize_capture_files()
+                try:
+                    source_files = self._finalize_capture_files()
+                    self._finalize_source_files(source_files)
+                except Exception as error:
+                    self.error_message = str(error)
+                    logger.exception("Failed to finalize source recordings")
             # Clean up generated intermediate files, keeping the source captures.
             for t in self.temp_files:
                 if t in self.capture_files:
@@ -463,12 +470,31 @@ class AudioRecorder(threading.Thread):
         return path
 
     def _finalize_capture_files(self):
+        source_files = []
         for partial_path in self.capture_files:
             if not os.path.exists(partial_path):
                 continue
             final_path = partial_path.replace(".partial.wav", ".wav")
             os.replace(partial_path, final_path)
-        logger.info("Source recordings saved in %s", self.recording_folder)
+            source_files.append(final_path)
+        logger.info("Source WAV recordings saved in %s", self.recording_folder)
+        return source_files
+
+    def _finalize_source_files(self, source_files):
+        if self.output_format != "mp3" or self.keep_source_wav:
+            if self.output_format == "mp3" and self.keep_source_wav:
+                logger.info("Keeping original WAV source recordings")
+            return
+
+        started = time.perf_counter()
+        for source_wav in source_files:
+            source_mp3 = os.path.splitext(source_wav)[0] + ".mp3"
+            self._convert_to_mp3(source_wav, source_mp3)
+            os.remove(source_wav)
+        logger.info(
+            "Source recordings converted to MP3 in %.3fs",
+            time.perf_counter() - started,
+        )
 
     def stop(self):
         self.stop_event.set()
@@ -532,17 +558,23 @@ class AudioRecorder(threading.Thread):
 
     def _convert_to_mp3(self, src_wav, dst_mp3):
         started = time.perf_counter()
-        with sf.SoundFile(src_wav, mode="r") as source:
-            encoder = self._create_mp3_encoder(source.samplerate, source.channels)
-            with open(dst_mp3, "wb") as output:
-                for block in source.blocks(
-                    blocksize=PROCESSING_BLOCK_FRAMES,
-                    dtype="float32",
-                    always_2d=True,
-                ):
-                    output.write(encoder.encode(self._pcm_bytes(block)))
-                output.write(encoder.flush())
-        logger.info("MP3 conversion completed in %.3fs", time.perf_counter() - started)
+        temporary_mp3 = f"{dst_mp3}.partial"
+        try:
+            with sf.SoundFile(src_wav, mode="r") as source:
+                encoder = self._create_mp3_encoder(source.samplerate, source.channels)
+                with open(temporary_mp3, "wb") as output:
+                    for block in source.blocks(
+                        blocksize=PROCESSING_BLOCK_FRAMES,
+                        dtype="float32",
+                        always_2d=True,
+                    ):
+                        output.write(encoder.encode(self._pcm_bytes(block)))
+                    output.write(encoder.flush())
+            os.replace(temporary_mp3, dst_mp3)
+            logger.info("MP3 conversion completed in %.3fs", time.perf_counter() - started)
+        finally:
+            if os.path.exists(temporary_mp3):
+                os.remove(temporary_mp3)
 
     def _mix_audio_to_mp3(self, file1, file2, dst_mp3):
         samplerate, channels = self._mixed_audio_format(file1, file2)
