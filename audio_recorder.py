@@ -10,18 +10,122 @@ import tempfile
 import shutil
 
 logger = logging.getLogger(__name__)
+PROCESSING_BLOCK_FRAMES = 16_384
 
-def _unique_output_path(output_folder, output_format):
+def _unique_output_path(output_folder, output_format, prefix="Recording"):
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     extension = output_format.lower()
-    path = os.path.join(output_folder, f"Recording_{timestamp}.{extension}")
+    path = os.path.join(output_folder, f"{prefix}_{timestamp}.{extension}")
     counter = 1
     while os.path.exists(path):
         path = os.path.join(
-            output_folder, f"Recording_{timestamp}_{counter}.{extension}"
+            output_folder, f"{prefix}_{timestamp}_{counter}.{extension}"
         )
         counter += 1
     return path
+
+
+def _create_recording_folder(output_folder):
+    os.makedirs(output_folder, exist_ok=True)
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    folder = os.path.join(output_folder, f"Recording_{timestamp}")
+    counter = 1
+    while os.path.exists(folder):
+        folder = os.path.join(output_folder, f"Recording_{timestamp}_{counter}")
+        counter += 1
+    os.makedirs(folder)
+    return folder
+
+
+class _StreamingAudioReader:
+    """Read a WAV as blocks at a shared sample rate and channel count."""
+
+    def __init__(
+        self,
+        filepath,
+        target_samplerate,
+        target_channels,
+        block_frames=PROCESSING_BLOCK_FRAMES,
+    ):
+        self._file = sf.SoundFile(filepath, mode="r")
+        self._source_samplerate = self._file.samplerate
+        self._source_frames = len(self._file)
+        self._target_samplerate = target_samplerate
+        self._target_channels = target_channels
+        self._block_frames = block_frames
+        self._ratio = self._source_samplerate / target_samplerate
+        self._buffer = np.empty((0, self._file.channels), dtype=np.float32)
+        self._buffer_start = 0
+        self._next_position = 0.0
+        self._finished = False
+
+    def read(self, frames):
+        if self._finished:
+            return self._silence(frames), False
+
+        if self._source_samplerate == self._target_samplerate:
+            data = self._file.read(frames, dtype="float32", always_2d=True)
+            has_audio = len(data) > 0
+            if len(data) < frames:
+                self._finished = True
+            return self._pad_and_convert(data, frames), has_audio
+
+        positions = self._next_position + np.arange(frames) * self._ratio
+        last_source_frame = self._source_frames - 1
+        valid_frames = int(
+            np.searchsorted(positions, last_source_frame, side="right")
+        )
+        if valid_frames == 0:
+            self._finished = True
+            return self._silence(frames), False
+
+        self._ensure_buffer_through(int(np.ceil(positions[valid_frames - 1])))
+        offsets = positions[:valid_frames] - self._buffer_start
+        lower = np.floor(offsets).astype(np.int64)
+        upper = np.minimum(lower + 1, len(self._buffer) - 1)
+        fractions = (offsets - lower)[:, np.newaxis]
+        data = self._buffer[lower] * (1.0 - fractions) + self._buffer[upper] * fractions
+
+        self._next_position += frames * self._ratio
+        self._discard_consumed_buffer()
+        if valid_frames < frames:
+            self._finished = True
+        return self._pad_and_convert(data, frames), True
+
+    def close(self):
+        self._file.close()
+
+    def _ensure_buffer_through(self, source_frame):
+        while self._buffer_start + len(self._buffer) - 1 < source_frame:
+            missing_frames = source_frame - (
+                self._buffer_start + len(self._buffer) - 1
+            )
+            data = self._file.read(
+                max(self._block_frames, missing_frames),
+                dtype="float32",
+                always_2d=True,
+            )
+            if not len(data):
+                break
+            self._buffer = np.concatenate((self._buffer, data))
+
+    def _discard_consumed_buffer(self):
+        keep_from = int(np.floor(self._next_position))
+        discard_count = max(0, keep_from - self._buffer_start)
+        if discard_count:
+            self._buffer = self._buffer[discard_count:]
+            self._buffer_start += discard_count
+
+    def _pad_and_convert(self, data, frames):
+        data = _to_channels(data, self._target_channels).astype(np.float32, copy=False)
+        if len(data) == frames:
+            return data
+        padded = self._silence(frames)
+        padded[: len(data)] = data
+        return padded
+
+    def _silence(self, frames):
+        return np.zeros((frames, self._target_channels), dtype=np.float32)
 
 class RawRecorder(threading.Thread):
     """
@@ -164,6 +268,8 @@ class AudioRecorder(threading.Thread):
         
         # Temp files
         self.temp_files = []
+        self.capture_files = []
+        self.recording_folder = None
         self.recorders = []
 
     def _get_device(self, is_loopback):
@@ -198,6 +304,8 @@ class AudioRecorder(threading.Thread):
         self.recording = True
         self.error_message = None
         self.temp_files = []
+        self.capture_files = []
+        self.recording_folder = None
         self.recorders = []
         self.audio = None
         
@@ -207,9 +315,10 @@ class AudioRecorder(threading.Thread):
                 # Need two recorders
                 dev_mic = self._get_device(is_loopback=False)
                 dev_loop = self._get_device(is_loopback=True)
-                
-                t1 = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
-                t2 = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
+
+                self.recording_folder = _create_recording_folder(self.output_folder)
+                t1 = self._capture_path("Microphone")
+                t2 = self._capture_path("SystemAudio")
                 self.temp_files = [t1, t2]
 
                 self.audio = pyaudio.PyAudio()
@@ -218,14 +327,16 @@ class AudioRecorder(threading.Thread):
                 
             elif self.source_mode == "loopback":
                 dev = self._get_device(is_loopback=True)
-                t1 = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
+                self.recording_folder = _create_recording_folder(self.output_folder)
+                t1 = self._capture_path("SystemAudio")
                 self.temp_files = [t1]
                 self.audio = pyaudio.PyAudio()
                 self.recorders.append(self._create_raw_recorder(dev, t1))
                 
             else: # mic
                 dev = self._get_device(is_loopback=False)
-                t1 = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
+                self.recording_folder = _create_recording_folder(self.output_folder)
+                t1 = self._capture_path("Microphone")
                 self.temp_files = [t1]
                 self.audio = pyaudio.PyAudio()
                 self.recorders.append(self._create_raw_recorder(dev, t1))
@@ -256,37 +367,59 @@ class AudioRecorder(threading.Thread):
                     raise Exception(f"Recorder error: {detail}")
             
             # 3. Stop Recording
+            stop_started = time.perf_counter()
             for r in self.recorders:
                 r.stop()
                 if r.error:
                     raise Exception(f"Recorder error: {r.error}")
+            logger.info(
+                "Input streams stopped in %.3fs", time.perf_counter() - stop_started
+            )
 
-            # 4. Mix/Process
+            # 4. Finalize
+            if not self.recording_folder:
+                raise RuntimeError("Recording output folder was not created")
+            self.final_filepath = _unique_output_path(
+                self.recording_folder, self.output_format, prefix="Merged"
+            )
+
             if len(self.temp_files) == 2:
-                mixed_wav = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
+                if not self.normalize:
+                    mix_started = time.perf_counter()
+                    if self.output_format == "mp3":
+                        self._mix_audio_to_mp3(
+                            self.temp_files[0], self.temp_files[1], self.final_filepath
+                        )
+                    else:
+                        self._mix_audio(
+                            self.temp_files[0], self.temp_files[1], self.final_filepath
+                        )
+                    logger.info(
+                        "Mixed and finalized both tracks in %.3fs",
+                        time.perf_counter() - mix_started,
+                    )
+                    return
+
+                descriptor, mixed_wav = tempfile.mkstemp(suffix=".wav")
+                os.close(descriptor)
+                mix_started = time.perf_counter()
                 self._mix_audio(self.temp_files[0], self.temp_files[1], mixed_wav)
-                # Use mixed file as source for next steps
                 source_wav = mixed_wav
-                self.temp_files.append(mixed_wav) # Mark for cleanup
+                self.temp_files.append(mixed_wav)
+                logger.info("Mixed both tracks in %.3fs", time.perf_counter() - mix_started)
             else:
                 source_wav = self.temp_files[0]
 
             # 5. Normalization
             if self.normalize:
                 self._normalize_audio(source_wav)
-            
-            # 6. Finalize
-            if not os.path.exists(self.output_folder):
-                os.makedirs(self.output_folder)
 
-            self.final_filepath = _unique_output_path(
-                self.output_folder, self.output_format
-            )
-            
             if self.output_format == "mp3":
                 self._convert_to_mp3(source_wav, self.final_filepath)
             else:
+                copy_started = time.perf_counter()
                 shutil.copy2(source_wav, self.final_filepath)
+                logger.info("WAV copy completed in %.3fs", time.perf_counter() - copy_started)
 
         except Exception as e:
             self.error_message = str(e)
@@ -305,8 +438,12 @@ class AudioRecorder(threading.Thread):
                 except Exception:
                     logger.exception("Failed to terminate audio backend")
                 self.audio = None
-            # Clean up all temp files
+            if self.error_message is None:
+                self._finalize_capture_files()
+            # Clean up generated intermediate files, keeping the source captures.
             for t in self.temp_files:
+                if t in self.capture_files:
+                    continue
                 if os.path.exists(t):
                     try:
                         os.remove(t)
@@ -320,74 +457,135 @@ class AudioRecorder(threading.Thread):
         recorder.audio = self.audio
         return recorder
 
+    def _capture_path(self, name):
+        path = os.path.join(self.recording_folder, f"{name}.partial.wav")
+        self.capture_files.append(path)
+        return path
+
+    def _finalize_capture_files(self):
+        for partial_path in self.capture_files:
+            if not os.path.exists(partial_path):
+                continue
+            final_path = partial_path.replace(".partial.wav", ".wav")
+            os.replace(partial_path, final_path)
+        logger.info("Source recordings saved in %s", self.recording_folder)
+
     def stop(self):
         self.stop_event.set()
 
     def _mix_audio(self, file1, file2, out_file):
-        d1, sr1 = sf.read(file1)
-        d2, sr2 = sf.read(file2)
-
-        if sr2 != sr1:
-            d2 = _resample_audio(d2, sr2, sr1)
-
-        target_channels = max(
-            d1.shape[1] if d1.ndim > 1 else 1,
-            d2.shape[1] if d2.ndim > 1 else 1,
-        )
-        d1 = _to_channels(d1, target_channels)
-        d2 = _to_channels(d2, target_channels)
-        
-        # Ensure same length
-        max_len = max(len(d1), len(d2))
-        
-        if len(d1) < max_len:
-            pad_width = max_len - len(d1)
-            d1 = np.concatenate(
-                (d1, np.zeros((pad_width, target_channels), dtype=d1.dtype))
-            )
-            
-        if len(d2) < max_len:
-            pad_width = max_len - len(d2)
-            d2 = np.concatenate(
-                (d2, np.zeros((pad_width, target_channels), dtype=d2.dtype))
-            )
-            
-        # Mix (Sum)
-        mixed = d1 + d2
-        # Clip
-        mixed = np.clip(mixed, -1.0, 1.0)
-        
-        sf.write(out_file, mixed, sr1)
+        samplerate, channels = self._mixed_audio_format(file1, file2)
+        with sf.SoundFile(
+            out_file,
+            mode="w",
+            samplerate=samplerate,
+            channels=channels,
+            subtype="PCM_16",
+        ) as output:
+            for mixed_block in self._iter_mixed_audio_blocks(file1, file2):
+                output.write(mixed_block)
 
     def _normalize_audio(self, filepath):
+        started = time.perf_counter()
+        normalized_path = None
         try:
-            data, sr = sf.read(filepath)
-            max_val = np.max(np.abs(data))
-            if max_val > 0:
-                target_peak = 0.99 
-                factor = target_peak / max_val
-                data = data * factor
-                sf.write(filepath, data, sr)
-        except Exception as e:
+            with sf.SoundFile(filepath, mode="r") as source:
+                max_val = 0.0
+                for block in source.blocks(
+                    blocksize=PROCESSING_BLOCK_FRAMES,
+                    dtype="float32",
+                    always_2d=True,
+                ):
+                    if len(block):
+                        max_val = max(max_val, float(np.max(np.abs(block))))
+                if max_val == 0:
+                    logger.info("Normalization skipped for silent recording")
+                    return
+                samplerate = source.samplerate
+                channels = source.channels
+                subtype = source.subtype
+
+            descriptor, normalized_path = tempfile.mkstemp(suffix=".wav")
+            os.close(descriptor)
+            factor = 0.99 / max_val
+            with sf.SoundFile(filepath, mode="r") as source, sf.SoundFile(
+                normalized_path,
+                mode="w",
+                samplerate=samplerate,
+                channels=channels,
+                subtype=subtype,
+            ) as output:
+                for block in source.blocks(
+                    blocksize=PROCESSING_BLOCK_FRAMES,
+                    dtype="float32",
+                    always_2d=True,
+                ):
+                    output.write(block * factor)
+            os.replace(normalized_path, filepath)
+            normalized_path = None
+            logger.info("Normalization completed in %.3fs", time.perf_counter() - started)
+        except Exception:
             logger.exception("Normalization failed for %s", filepath)
+        finally:
+            if normalized_path and os.path.exists(normalized_path):
+                os.remove(normalized_path)
 
     def _convert_to_mp3(self, src_wav, dst_mp3):
-        data, sr = sf.read(src_wav)
-        channels = data.shape[1] if data.ndim > 1 else 1
-        
-        pcm_data = (data * 32767).clip(-32768, 32767).astype(np.int16)
-        
+        started = time.perf_counter()
+        with sf.SoundFile(src_wav, mode="r") as source:
+            encoder = self._create_mp3_encoder(source.samplerate, source.channels)
+            with open(dst_mp3, "wb") as output:
+                for block in source.blocks(
+                    blocksize=PROCESSING_BLOCK_FRAMES,
+                    dtype="float32",
+                    always_2d=True,
+                ):
+                    output.write(encoder.encode(self._pcm_bytes(block)))
+                output.write(encoder.flush())
+        logger.info("MP3 conversion completed in %.3fs", time.perf_counter() - started)
+
+    def _mix_audio_to_mp3(self, file1, file2, dst_mp3):
+        samplerate, channels = self._mixed_audio_format(file1, file2)
+        encoder = self._create_mp3_encoder(samplerate, channels)
+        with open(dst_mp3, "wb") as output:
+            for mixed_block in self._iter_mixed_audio_blocks(file1, file2):
+                output.write(encoder.encode(self._pcm_bytes(mixed_block)))
+            output.write(encoder.flush())
+
+    def _iter_mixed_audio_blocks(self, file1, file2):
+        samplerate, channels = self._mixed_audio_format(file1, file2)
+        first = _StreamingAudioReader(file1, samplerate, channels)
+        second = _StreamingAudioReader(file2, samplerate, channels)
+        try:
+            while True:
+                first_block, first_has_audio = first.read(PROCESSING_BLOCK_FRAMES)
+                second_block, second_has_audio = second.read(PROCESSING_BLOCK_FRAMES)
+                if not first_has_audio and not second_has_audio:
+                    return
+                yield np.clip(first_block + second_block, -1.0, 1.0)
+        finally:
+            first.close()
+            second.close()
+
+    @staticmethod
+    def _mixed_audio_format(file1, file2):
+        first = sf.info(file1)
+        second = sf.info(file2)
+        return first.samplerate, max(first.channels, second.channels)
+
+    @staticmethod
+    def _create_mp3_encoder(samplerate, channels):
         encoder = lameenc.Encoder()
         encoder.set_bit_rate(192)
-        encoder.set_in_sample_rate(sr)
+        encoder.set_in_sample_rate(samplerate)
         encoder.set_channels(channels)
         encoder.set_quality(2)
-        
-        mp3_data = encoder.encode(pcm_data.tobytes())
-        mp3_data += encoder.flush()
-        
-        with open(dst_mp3, "wb") as f_mp3:
-            f_mp3.write(mp3_data)
+        return encoder
+
+    @staticmethod
+    def _pcm_bytes(data):
+        pcm_data = np.clip(data * 32767, -32768, 32767).astype(np.int16)
+        return np.ascontiguousarray(pcm_data).tobytes()
 
 def get_devices(include_loopback=False):
     try:

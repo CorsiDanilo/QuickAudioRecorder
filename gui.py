@@ -4,6 +4,7 @@ import json
 import logging
 import shutil
 import tempfile
+import time
 from PyQt6.QtWidgets import (QApplication, QSystemTrayIcon, QMenu, QMainWindow,
                              QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox,
                              QPushButton, QFileDialog, QMessageBox, QGroupBox, 
@@ -485,9 +486,17 @@ class TrayApplication(QObject):
         self.tray_icon.showMessage("Started", f"Recording {mode}", QSystemTrayIcon.MessageIcon.NoIcon, 1000)
 
     def stop_recording(self):
-        if self.recorder:
+        if self.recorder and self.recorder.is_alive():
             logger.info("Stopping recording")
             self.recorder.stop()
+            self.action_stop.setEnabled(False)
+            self.tray_icon.setToolTip("Saving recording...")
+            self.tray_icon.showMessage(
+                "Saving",
+                "Finalizing recording...",
+                QSystemTrayIcon.MessageIcon.NoIcon,
+                1000,
+            )
 
     def on_recording_finished(self, path, error):
         self.action_record_mic.setEnabled(True)
@@ -505,9 +514,11 @@ class TrayApplication(QObject):
             
         settings = self.settings_window.get_settings()
         final_path = path
-        msg = f"Saved to {os.path.basename(path)}"
+        folder_name = os.path.basename(os.path.dirname(path))
+        msg = f"Saved in {folder_name}: {os.path.basename(path)}"
         
         if settings['clipboard'] and os.path.exists(path):
+            clipboard_started = time.perf_counter()
             try:
                 if settings['delete_after']:
                     temp_dir = tempfile.gettempdir()
@@ -527,13 +538,15 @@ class TrayApplication(QObject):
                 if not success:
                     logger.error("Clipboard copy failed: %s", status)
                     msg += f"\nClipboard Error: {status}"
-                else:
-                    # Optional: Log success?
-                    pass
                 
             except Exception as e:
                 logger.exception("Clipboard or file move failed")
                 msg += f"\nClipboard/Move error: {e}"
+            finally:
+                logger.info(
+                    "Clipboard processing completed in %.3fs",
+                    time.perf_counter() - clipboard_started,
+                )
 
         logger.info("Recording finished: %s", path)
         self.tray_icon.showMessage("Finished", msg, QSystemTrayIcon.MessageIcon.Information, 2000)
