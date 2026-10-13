@@ -687,3 +687,248 @@ def _resample_audio(data, source_rate, target_rate):
             for channel in range(data.shape[1])
         ]
     )
+
+
+def find_output_device_for_loopback(loopback_id):
+    """
+    Finds the WASAPI playback (output) device corresponding to the given loopback device ID.
+    If loopback_id is None or no matching name is found, falls back to the default WASAPI output device.
+    """
+    try:
+        with pyaudio.PyAudio() as audio:
+            if loopback_id is not None:
+                try:
+                    lb_info = audio.get_device_info_by_index(int(loopback_id))
+                    clean_name = (
+                        lb_info.get("name", "")
+                        .replace(" [Loopback]", "")
+                        .strip()
+                    )
+                    for device in audio.get_device_info_generator_by_host_api(
+                        host_api_type=pyaudio.paWASAPI
+                    ):
+                        if (
+                            device.get("maxOutputChannels", 0) > 0
+                            and not device.get("isLoopbackDevice", False)
+                        ):
+                            d_name = device.get("name", "").strip()
+                            if d_name == clean_name or clean_name in d_name:
+                                return int(device["index"])
+                except Exception:
+                    logger.warning(
+                        "Could not resolve loopback ID %s to output device",
+                        loopback_id,
+                    )
+            default_out = audio.get_default_wasapi_device(d_out=True)
+            return int(default_out["index"])
+    except Exception:
+        logger.exception("Error finding output device for loopback")
+        return None
+
+
+def generate_test_chime(sample_rate=44100, channels=2, duration=0.9):
+    """
+    Synthesize a pleasant harmonic chime (two successive notes with soft decay)
+    using numpy, without requiring any external audio files.
+    """
+    t = np.linspace(
+        0, duration, int(sample_rate * duration), endpoint=False, dtype=np.float32
+    )
+    # Note 1: 587.33 Hz (D5) from 0.0s to 0.45s
+    t1 = t[t < 0.45]
+    n1 = 0.28 * np.sin(2 * np.pi * 587.33 * t1) * np.exp(-t1 * 7.0)
+    # Note 2: 880.0 Hz (A5) from 0.2s to end
+    offset2 = 0.2
+    t2 = t[t >= offset2] - offset2
+    n2 = 0.28 * np.sin(2 * np.pi * 880.0 * t2) * np.exp(-t2 * 5.5)
+
+    audio_signal = np.zeros_like(t)
+    audio_signal[: len(n1)] += n1
+    audio_signal[int(sample_rate * offset2) : int(sample_rate * offset2) + len(n2)] += n2
+
+    if channels == 1:
+        pcm_channels = audio_signal[:, np.newaxis]
+    else:
+        # Subtle stereo widening
+        left = audio_signal.copy()
+        right = audio_signal.copy()
+        left[: len(n1)] *= 1.15
+        right[int(sample_rate * offset2) :] *= 1.15
+        pcm_channels = np.column_stack([left, right])
+
+    pcm_data = (np.clip(pcm_channels, -1.0, 1.0) * 32767).astype(np.int16)
+    return pcm_data.tobytes()
+
+
+def play_test_sound(loopback_id=None, output_device_id=None):
+    """
+    Plays the synthetic test chime on the target WASAPI output device.
+    """
+    target_idx = None
+    try:
+        with pyaudio.PyAudio() as audio:
+            target_idx = output_device_id
+            if target_idx is None:
+                target_idx = find_output_device_for_loopback(loopback_id)
+            if target_idx is None:
+                default_out = audio.get_default_wasapi_device(d_out=True)
+                target_idx = int(default_out["index"])
+
+            info = audio.get_device_info_by_index(target_idx)
+            sample_rate = int(float(info.get("defaultSampleRate", 44100)))
+            max_channels = int(info.get("maxOutputChannels", 2))
+            channels = min(2, max(1, max_channels))
+
+            for probe_rate in (sample_rate, 48000, 44100):
+                try:
+                    audio.is_format_supported(
+                        probe_rate,
+                        output_device=target_idx,
+                        output_channels=channels,
+                        output_format=pyaudio.paInt16,
+                    )
+                    sample_rate = probe_rate
+                    break
+                except Exception:
+                    continue
+
+            pcm_bytes = generate_test_chime(
+                sample_rate=sample_rate, channels=channels
+            )
+            stream = audio.open(
+                format=pyaudio.paInt16,
+                channels=channels,
+                rate=sample_rate,
+                output=True,
+                output_device_index=target_idx,
+                frames_per_buffer=1024,
+            )
+            try:
+                chunk_size = 1024 * channels * 2
+                for offset in range(0, len(pcm_bytes), chunk_size):
+                    chunk = pcm_bytes[offset : offset + chunk_size]
+                    stream.write(chunk)
+            finally:
+                stream.stop_stream()
+                stream.close()
+    except Exception:
+        logger.exception("Failed to play test sound on device %s", target_idx)
+        raise
+
+
+class AudioMonitorThread(threading.Thread):
+    """
+    Captures live audio from an input device in real time, computes FFT spectrum bands
+    and RMS level, and notifies callbacks. Does not write to disk.
+    """
+
+    def __init__(
+        self,
+        device_id,
+        num_bands=28,
+        callback=None,
+        error_callback=None,
+    ):
+        super().__init__(daemon=True)
+        self.device_id = device_id
+        self.num_bands = num_bands
+        self.callback = callback
+        self.error_callback = error_callback
+        self.stop_event = threading.Event()
+
+    def run(self):
+        audio = None
+        stream = None
+        try:
+            audio = pyaudio.PyAudio()
+            device = audio.get_device_info_by_index(int(self.device_id))
+            device_channels = int(device.get("maxInputChannels", 0))
+            if device_channels < 1:
+                raise RuntimeError("Selected device has no input channels.")
+
+            default_rate = int(float(device.get("defaultSampleRate", 44100)))
+            sample_rate = default_rate
+            for rate in (default_rate, 48000, 44100, 16000, 8000):
+                try:
+                    audio.is_format_supported(
+                        rate,
+                        input_device=int(self.device_id),
+                        input_channels=1,
+                        input_format=pyaudio.paInt16,
+                    )
+                    sample_rate = rate
+                    break
+                except Exception:
+                    continue
+
+            frames_per_buffer = 1024
+            freqs = np.fft.rfftfreq(frames_per_buffer, 1.0 / sample_rate)
+            edges = np.geomspace(
+                60, min(16000, sample_rate // 2), self.num_bands + 1
+            )
+            band_masks = [
+                (freqs >= edges[i]) & (freqs < edges[i + 1])
+                for i in range(self.num_bands)
+            ]
+            window = np.hanning(frames_per_buffer)
+
+            stream = audio.open(
+                format=pyaudio.paInt16,
+                channels=1,
+                rate=sample_rate,
+                input=True,
+                input_device_index=int(self.device_id),
+                frames_per_buffer=frames_per_buffer,
+            )
+
+            while not self.stop_event.is_set():
+                try:
+                    raw_data = stream.read(
+                        frames_per_buffer, exception_on_overflow=False
+                    )
+                except Exception:
+                    if self.stop_event.is_set():
+                        break
+                    continue
+
+                if self.stop_event.is_set():
+                    break
+
+                samples = (
+                    np.frombuffer(raw_data, dtype=np.int16).astype(np.float32)
+                    / 32768.0
+                )
+                rms = float(np.sqrt(np.mean(samples**2)))
+
+                fft_vals = np.abs(np.fft.rfft(samples * window)) / (
+                    frames_per_buffer / 2
+                )
+                band_values = [
+                    float(np.mean(fft_vals[mask])) if np.any(mask) else 0.0
+                    for mask in band_masks
+                ]
+
+                if self.callback and not self.stop_event.is_set():
+                    self.callback(band_values, rms)
+
+        except Exception as error:
+            logger.exception("Audio monitor thread failed")
+            if self.error_callback and not self.stop_event.is_set():
+                self.error_callback(str(error))
+        finally:
+            if stream is not None:
+                try:
+                    stream.stop_stream()
+                    stream.close()
+                except Exception:
+                    pass
+            if audio is not None:
+                try:
+                    audio.terminate()
+                except Exception:
+                    pass
+
+    def stop(self):
+        self.stop_event.set()
+        self.join(timeout=1.0)
+

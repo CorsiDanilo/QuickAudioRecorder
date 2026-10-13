@@ -12,7 +12,10 @@ from pathlib import Path
 
 def _load_modules():
     for name in ("soundcard", "soundfile", "lameenc", "numpy"):
-        sys.modules.setdefault(name, types.ModuleType(name))
+        try:
+            __import__(name)
+        except ImportError:
+            sys.modules.setdefault(name, types.ModuleType(name))
 
     try:
         import PyQt6.QtCore  # noqa: F401
@@ -269,6 +272,93 @@ class RegressionTests(unittest.TestCase):
         )
         self.assertIn("--icon=app_icon.ico", workflow)
         self.assertIn("--add-data", workflow)
+
+    def test_generate_test_chime_produces_pcm_bytes(self):
+        sample_rate = 44100
+        duration = 0.5
+        pcm_bytes = audio_recorder.generate_test_chime(
+            sample_rate=sample_rate, channels=2, duration=duration
+        )
+        self.assertIsInstance(pcm_bytes, bytes)
+        expected_len = int(sample_rate * duration) * 2 * 2  # 2 channels * 2 bytes per int16
+        self.assertEqual(len(pcm_bytes), expected_len)
+
+    def test_find_output_device_for_loopback_maps_matching_name(self):
+        class FakeAudio:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                pass
+
+            def get_device_info_by_index(self, index):
+                if index == 19:
+                    return {
+                        "index": 19,
+                        "name": "Headphones (Realtek) [Loopback]",
+                        "isLoopbackDevice": True,
+                    }
+                raise ValueError("Unknown index")
+
+            def get_device_info_generator_by_host_api(self, host_api_type):
+                return [
+                    {
+                        "index": 10,
+                        "name": "Headphones (Realtek)",
+                        "maxOutputChannels": 2,
+                        "isLoopbackDevice": False,
+                    },
+                    {
+                        "index": 11,
+                        "name": "Speakers (Other)",
+                        "maxOutputChannels": 2,
+                        "isLoopbackDevice": False,
+                    },
+                ]
+
+            def get_default_wasapi_device(self, d_out=True):
+                return {"index": 11}
+
+        with patch.object(audio_recorder.pyaudio, "PyAudio", return_value=FakeAudio()):
+            output_id = audio_recorder.find_output_device_for_loopback(19)
+
+        self.assertEqual(output_id, 10)
+
+    def test_find_output_device_for_loopback_falls_back_to_default_output(self):
+        class FakeAudio:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                pass
+
+            def get_default_wasapi_device(self, d_out=True):
+                return {"index": 99}
+
+        with patch.object(audio_recorder.pyaudio, "PyAudio", return_value=FakeAudio()):
+            output_id = audio_recorder.find_output_device_for_loopback(None)
+
+        self.assertEqual(output_id, 99)
+
+    def test_gui_exposes_test_buttons_and_spectrum_widget(self):
+        source = Path("gui.py").read_text(encoding="utf-8")
+        self.assertIn("self.btn_test_mic", source)
+        self.assertIn("self.btn_test_loopback", source)
+        self.assertIn("self.spectrum_widget", source)
+        self.assertIn("AudioSpectrumWidget", source)
+        self.assertIn("AudioMonitorThread", source)
+
+    def test_tray_menu_includes_audio_devices_submenu_and_refresh_action(self):
+        source = Path("gui.py").read_text(encoding="utf-8")
+        self.assertIn("self.menu_devices", source)
+        self.assertIn("self.menu_mic", source)
+        self.assertIn("self.menu_loop", source)
+        self.assertIn("self.action_refresh_devices", source)
+        self.assertIn("self.populate_device_menus", source)
+
+    def test_start_recording_refreshes_devices_before_starting(self):
+        source = Path("gui.py").read_text(encoding="utf-8")
+        self.assertIn("self.settings_window.refresh_devices(preserve_selection=True)", source)
 
 
 if __name__ == "__main__":
