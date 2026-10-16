@@ -6,11 +6,12 @@ import time
 import os
 import lameenc
 import numpy as np
-import tempfile
 import shutil
 
 logger = logging.getLogger(__name__)
 PROCESSING_BLOCK_FRAMES = 16_384
+SPECTRUM_FRAMES = 1024
+SPECTRUM_BANDS = 28
 
 def _unique_output_path(output_folder, output_format, prefix="Recording"):
     timestamp = time.strftime("%Y%m%d_%H%M%S")
@@ -127,20 +128,70 @@ class _StreamingAudioReader:
     def _silence(self, frames):
         return np.zeros((frames, self._target_channels), dtype=np.float32)
 
+
+def _calculate_audio_levels(data, samplerate, num_bands=SPECTRUM_BANDS):
+    samples = np.asarray(data, dtype=np.float32)
+    if samples.ndim > 1:
+        samples = np.mean(samples, axis=1)
+    samples = samples.reshape(-1)
+    if not len(samples):
+        return [0.0] * num_bands, 0.0
+
+    if len(samples) < SPECTRUM_FRAMES:
+        padded = np.zeros(SPECTRUM_FRAMES, dtype=np.float32)
+        padded[: len(samples)] = samples
+        samples = padded
+    else:
+        samples = samples[:SPECTRUM_FRAMES]
+
+    rms = float(np.sqrt(np.mean(samples**2)))
+    freqs = np.fft.rfftfreq(SPECTRUM_FRAMES, 1.0 / samplerate)
+    edges = np.geomspace(
+        60,
+        max(61, min(16000, samplerate // 2)),
+        num_bands + 1,
+    )
+    fft_vals = np.abs(np.fft.rfft(samples * np.hanning(SPECTRUM_FRAMES))) / (
+        SPECTRUM_FRAMES / 2
+    )
+    band_values = [
+        float(np.mean(fft_vals[(freqs >= edges[i]) & (freqs < edges[i + 1])]))
+        if np.any((freqs >= edges[i]) & (freqs < edges[i + 1]))
+        else 0.0
+        for i in range(num_bands)
+    ]
+    return band_values, rms
+
 class RawRecorder(threading.Thread):
     """
     Helper thread to record a single device to a WAV file.
     """
-    def __init__(self, device, filepath, samplerate=44100, channels=2, audio=None):
+    def __init__(
+        self,
+        device,
+        filepath,
+        samplerate=44100,
+        channels=2,
+        audio=None,
+        source_name="Unknown",
+        levels_callback=None,
+    ):
         super().__init__()
         self.device = device
         self.filepath = filepath
         self.samplerate = samplerate
         self.channels = channels
         self.audio = audio
+        self.source_name = source_name
+        self.levels_callback = levels_callback
         self.stop_event = threading.Event()
         self.finished_event = threading.Event()
         self.error = None
+        self.device_disconnected = False
+        self.frames_written = 0
+        self._switch_lock = threading.Lock()
+        self._pending_device = None
+        self._switch_event = threading.Event()
 
     def run(self):
         audio = self.audio
@@ -148,89 +199,203 @@ class RawRecorder(threading.Thread):
         try:
             if owns_audio:
                 audio = pyaudio.PyAudio()
-            samplerate, channels = self._probe_params(audio)
+            output_samplerate, output_channels = self._probe_params(
+                audio, self.device
+            )
             with sf.SoundFile(
                 self.filepath,
                 mode="w",
-                samplerate=samplerate,
-                channels=channels,
+                samplerate=output_samplerate,
+                channels=output_channels,
                 subtype="PCM_16",
             ) as f_wav:
-                def callback(in_data, frame_count, time_info, status):
-                    if self.stop_event.is_set():
-                        return (None, pyaudio.paComplete)
-                    try:
-                        data = np.frombuffer(in_data, dtype=np.int16)
-                        if channels > 1:
-                            data = data.reshape(-1, channels)
-                        data = data.astype(np.float32) / 32768.0
-                        f_wav.write(data)
-                    except Exception as error:
-                        self.error = f"{type(error).__name__}: {error}".rstrip()
-                        logger.exception(
-                            "Audio callback failed for %s", self.filepath
-                        )
-                        return (None, pyaudio.paAbort)
-                    return (None, pyaudio.paContinue)
+                current_device = self.device
+                while not self.stop_event.is_set():
+                    stream = None
+                    samplerate, channels = self._probe_params(
+                        audio,
+                        current_device,
+                        preferred_samplerate=output_samplerate,
+                        preferred_channels=output_channels,
+                    )
 
-                stream_args = {
-                    "format": pyaudio.paInt16,
-                    "channels": channels,
-                    "rate": samplerate,
-                    "frames_per_buffer": 2048,
-                    "input": True,
-                    "input_device_index": int(self.device["index"]),
-                }
-                use_callback = bool(self.device.get("isLoopbackDevice"))
-                if use_callback:
-                    stream_args["stream_callback"] = callback
-                stream = audio.open(**stream_args)
-                try:
-                    if use_callback:
-                        while not self.stop_event.wait(0.1):
-                            if self.error:
-                                raise RuntimeError(self.error)
-                    else:
-                        while not self.stop_event.is_set():
-                            raw_data = stream.read(
-                                2048, exception_on_overflow=False
-                            )
-                            data = np.frombuffer(raw_data, dtype=np.int16)
+                    def write_data(data):
+                        prepared = _to_channels(data, output_channels)
+                        prepared = _resample_audio(
+                            prepared, samplerate, output_samplerate
+                        )
+                        f_wav.write(prepared)
+                        self.frames_written += len(prepared)
+
+                    def callback(in_data, frame_count, time_info, status):
+                        if self.stop_event.is_set():
+                            return (None, pyaudio.paComplete)
+                        try:
+                            data = np.frombuffer(in_data, dtype=np.int16)
                             if channels > 1:
                                 data = data.reshape(-1, channels)
                             data = data.astype(np.float32) / 32768.0
-                            f_wav.write(data)
-                finally:
-                    stream.stop_stream()
-                    stream.close()
+                            write_data(data)
+                            self._notify_levels(data, samplerate)
+                        except Exception as error:
+                            if not self._switch_event.is_set():
+                                self.device_disconnected = True
+                                self.error = f"{type(error).__name__}: {error}".rstrip()
+                            logger.exception(
+                                "Audio callback failed for %s", self.filepath
+                            )
+                            return (None, pyaudio.paAbort)
+                        return (None, pyaudio.paContinue)
+
+                    stream_args = {
+                        "format": pyaudio.paInt16,
+                        "channels": channels,
+                        "rate": samplerate,
+                        "frames_per_buffer": 2048,
+                        "input": True,
+                        "input_device_index": int(current_device["index"]),
+                    }
+                    use_callback = bool(current_device.get("isLoopbackDevice"))
+                    if use_callback:
+                        stream_args["stream_callback"] = callback
+                    try:
+                        stream = audio.open(**stream_args)
+                        if use_callback:
+                            while not self.stop_event.wait(0.1):
+                                if self._switch_event.is_set():
+                                    break
+                                if self.error:
+                                    if not self._switch_event.is_set():
+                                        self.device_disconnected = True
+                                    break
+                                try:
+                                    if not stream.is_active():
+                                        if not self._switch_event.is_set():
+                                            self.device_disconnected = True
+                                        logger.warning(
+                                            "Stream became inactive for %s",
+                                            self.filepath,
+                                        )
+                                        break
+                                except Exception:
+                                    if not self._switch_event.is_set():
+                                        self.device_disconnected = True
+                                    break
+                        else:
+                            while not self.stop_event.is_set():
+                                if self._switch_event.is_set():
+                                    break
+                                try:
+                                    raw_data = stream.read(
+                                        2048, exception_on_overflow=False
+                                    )
+                                except Exception as read_err:
+                                    if not self._switch_event.is_set():
+                                        self.device_disconnected = True
+                                    logger.warning(
+                                        "Stream read failed (device disconnected?) for %s: %s",
+                                        self.filepath,
+                                        read_err,
+                                    )
+                                    break
+                                data = np.frombuffer(raw_data, dtype=np.int16)
+                                if channels > 1:
+                                    data = data.reshape(-1, channels)
+                                data = data.astype(np.float32) / 32768.0
+                                write_data(data)
+                                self._notify_levels(data, samplerate)
+                    finally:
+                        if stream is not None:
+                            try:
+                                stream.stop_stream()
+                            except Exception:
+                                pass
+                            try:
+                                stream.close()
+                            except Exception:
+                                pass
+
+                    if self.stop_event.is_set():
+                        break
+
+                    next_device = self._take_pending_device()
+                    if next_device is None:
+                        if not self.device_disconnected and not self.error:
+                            self.device_disconnected = True
+                        break
+
+                    current_device = next_device
+                    self.device = current_device
+                    self.error = None
+                    self.device_disconnected = False
+                    logger.info(
+                        "Switched %s capture stream to device %s",
+                        self.source_name,
+                        current_device.get("name", current_device.get("index")),
+                    )
         except Exception as e:
-            self.error = f"{type(e).__name__}: {e}".rstrip()
+            if not self.device_disconnected:
+                self.error = f"{type(e).__name__}: {e}".rstrip()
             logger.exception("Raw recorder failed for %s", self.filepath)
         finally:
             if owns_audio and audio is not None:
-                audio.terminate()
+                try:
+                    audio.terminate()
+                except Exception:
+                    pass
             self.finished_event.set()
+
+    def switch_device(self, device):
+        with self._switch_lock:
+            self._pending_device = device
+            self._switch_event.set()
+
+    def _take_pending_device(self):
+        with self._switch_lock:
+            device = self._pending_device
+            self._pending_device = None
+            self._switch_event.clear()
+            return device
 
     def stop(self):
         self.stop_event.set()
         self.join()
 
-    def _probe_params(self, audio):
-        device_channels = int(self.device.get("maxInputChannels", 0))
-        channels = min(self.channels, device_channels) if device_channels else 1
-        default_rate = int(float(self.device.get("defaultSampleRate", self.samplerate)))
+    def _probe_params(
+        self,
+        audio,
+        device=None,
+        preferred_samplerate=None,
+        preferred_channels=None,
+    ):
+        device = device or self.device
+        device_channels = int(device.get("maxInputChannels", 0))
+        requested_channels = preferred_channels or self.channels
+        channels = min(requested_channels, device_channels) if device_channels else 1
+        default_rate = int(float(device.get("defaultSampleRate", self.samplerate)))
         sample_rates = []
-        for rate in (self.samplerate, default_rate, 48000, 44100, 16000, 8000):
+        for rate in (
+            preferred_samplerate,
+            self.samplerate,
+            default_rate,
+            48000,
+            44100,
+            16000,
+            8000,
+        ):
+            if rate is None:
+                continue
             if rate not in sample_rates:
                 sample_rates.append(rate)
 
         failures = []
         for samplerate in sample_rates:
-            for channel_count in ([channels, 1] if channels != 1 else [1]):
+            channel_candidates = [channels, 1] if channels != 1 else [1]
+            for channel_count in channel_candidates:
                 try:
                     audio.is_format_supported(
                         samplerate,
-                        input_device=int(self.device["index"]),
+                        input_device=int(device["index"]),
                         input_channels=channel_count,
                         input_format=pyaudio.paInt16,
                     )
@@ -246,25 +411,37 @@ class RawRecorder(threading.Thread):
             "audio parameter combinations:\n" + "\n".join(failures)
         )
 
+    def _notify_levels(self, data, samplerate):
+        if not self.levels_callback:
+            return
+        try:
+            bands, rms = _calculate_audio_levels(data, samplerate)
+            self.levels_callback(self.source_name, bands, rms)
+        except Exception:
+            logger.exception("Audio level analysis failed for %s", self.filepath)
+
 class AudioRecorder(threading.Thread):
     """
     Orchestrates recording from Microphone, Loopback, or Both.
     """
     def __init__(self, mic_id, source_mode, output_folder, output_format="mp3",
-                 normalize=False, on_finish_callback=None, loopback_id=None,
-                 keep_source_wav=False):
+                 on_finish_callback=None, loopback_id=None,
+                 on_capture_stopped_callback=None, on_levels_callback=None):
         super().__init__()
         self.mic_id = mic_id
         self.source_mode = source_mode # "mic", "loopback", "both"
         self.output_folder = output_folder
         self.output_format = output_format.lower()
-        self.normalize = normalize
         self.callback = on_finish_callback
         self.loopback_id = loopback_id
-        self.keep_source_wav = keep_source_wav
+        self.on_capture_stopped_callback = on_capture_stopped_callback
+        self.on_levels_callback = on_levels_callback
         
         self.recording = False
+        self.is_capturing = False
+        self._capture_stopped_notified = False
         self.stop_event = threading.Event()
+        self.device_disconnected = False
         self.error_message = None
         self.final_filepath = None
         
@@ -273,6 +450,8 @@ class AudioRecorder(threading.Thread):
         self.capture_files = []
         self.recording_folder = None
         self.recorders = []
+        self._device_switch_lock = threading.Lock()
+        self._pending_device_switches = {}
 
     def _get_device(self, is_loopback):
         with pyaudio.PyAudio() as audio:
@@ -302,8 +481,84 @@ class AudioRecorder(threading.Thread):
                     f"Could not detect system audio loopback device for '{speaker_name}'."
                 ) from error
 
+    def _get_device_by_id(self, device_id, is_loopback):
+        with pyaudio.PyAudio() as audio:
+            device = audio.get_device_info_by_index(int(device_id))
+            if is_loopback and not device.get("isLoopbackDevice", False):
+                raise RuntimeError(
+                    f"Selected audio device '{device.get('name', device_id)}' "
+                    "is not a loopback device."
+                )
+            if not is_loopback and device.get("isLoopbackDevice", False):
+                raise RuntimeError(
+                    f"Selected microphone '{device.get('name', device_id)}' "
+                    "is a loopback device."
+                )
+            return device
+
+    def switch_device(self, source_name, device_id):
+        if source_name not in ("Microphone", "SystemAudio"):
+            return False
+        if self.stop_event.is_set() or not self.is_capturing:
+            return False
+
+        with self._device_switch_lock:
+            self._pending_device_switches[source_name] = device_id
+
+        recorder = next(
+            (r for r in self.recorders if r.source_name == source_name),
+            None,
+        )
+        if recorder is None:
+            return True
+
+        applied = self._apply_device_switch(source_name, device_id, recorder)
+        with self._device_switch_lock:
+            self._pending_device_switches.pop(source_name, None)
+        return applied
+
+    def _apply_pending_device_switches(self):
+        with self._device_switch_lock:
+            pending = dict(self._pending_device_switches)
+            self._pending_device_switches.clear()
+
+        for source_name, device_id in pending.items():
+            recorder = next(
+                (r for r in self.recorders if r.source_name == source_name),
+                None,
+            )
+            if recorder is not None:
+                self._apply_device_switch(source_name, device_id, recorder)
+
+    def _apply_device_switch(self, source_name, device_id, recorder):
+        try:
+            device = self._get_device_by_id(
+                device_id, is_loopback=(source_name == "SystemAudio")
+            )
+        except Exception:
+            logger.exception(
+                "Unable to switch %s capture to device %s",
+                source_name,
+                device_id,
+            )
+            return False
+
+        recorder.switch_device(device)
+        if source_name == "Microphone":
+            self.mic_id = device_id
+        else:
+            self.loopback_id = device_id
+        logger.info(
+            "Requested hot switch for %s to device %s",
+            source_name,
+            device.get("name", device_id),
+        )
+        return True
+
     def run(self):
         self.recording = True
+        self.is_capturing = True
+        self._capture_stopped_notified = False
         self.error_message = None
         self.temp_files = []
         self.capture_files = []
@@ -324,8 +579,12 @@ class AudioRecorder(threading.Thread):
                 self.temp_files = [t1, t2]
 
                 self.audio = pyaudio.PyAudio()
-                self.recorders.append(self._create_raw_recorder(dev_mic, t1))
-                self.recorders.append(self._create_raw_recorder(dev_loop, t2))
+                self.recorders.append(
+                    self._create_raw_recorder(dev_mic, t1, "Microphone")
+                )
+                self.recorders.append(
+                    self._create_raw_recorder(dev_loop, t2, "SystemAudio")
+                )
                 
             elif self.source_mode == "loopback":
                 dev = self._get_device(is_loopback=True)
@@ -333,7 +592,9 @@ class AudioRecorder(threading.Thread):
                 t1 = self._capture_path("SystemAudio")
                 self.temp_files = [t1]
                 self.audio = pyaudio.PyAudio()
-                self.recorders.append(self._create_raw_recorder(dev, t1))
+                self.recorders.append(
+                    self._create_raw_recorder(dev, t1, "SystemAudio")
+                )
                 
             else: # mic
                 dev = self._get_device(is_loopback=False)
@@ -341,9 +602,13 @@ class AudioRecorder(threading.Thread):
                 t1 = self._capture_path("Microphone")
                 self.temp_files = [t1]
                 self.audio = pyaudio.PyAudio()
-                self.recorders.append(self._create_raw_recorder(dev, t1))
+                self.recorders.append(
+                    self._create_raw_recorder(dev, t1, "Microphone")
+                )
 
             logger.info("Starting recording mode: %s", self.source_mode)
+
+            self._apply_pending_device_switches()
 
             # 2. Start Recording
             for r in self.recorders:
@@ -351,6 +616,24 @@ class AudioRecorder(threading.Thread):
             
             # Wait for stop signal or an unexpected recorder failure.
             while not self.stop_event.wait(0.1):
+                # 1. Did any recorder report device disconnection?
+                disconnected = next(
+                    (
+                        r
+                        for r in self.recorders
+                        if getattr(r, "device_disconnected", False)
+                    ),
+                    None,
+                )
+                if disconnected:
+                    logger.warning(
+                        "Recorder %s detected device disconnect. Stopping recording cleanly.",
+                        getattr(disconnected, "filepath", "unknown"),
+                    )
+                    self.device_disconnected = True
+                    break
+
+                # 2. Did any recorder fail or finish unexpectedly?
                 failed = next(
                     (
                         r
@@ -365,56 +648,69 @@ class AudioRecorder(threading.Thread):
                     None,
                 )
                 if failed:
+                    total_frames = sum(
+                        getattr(r, "frames_written", 0) for r in self.recorders
+                    )
+                    if total_frames > 0 or getattr(failed, "device_disconnected", False):
+                        logger.warning(
+                            "Recorder %s stopped after capturing audio (%s, frames=%d). Treating as device disconnect.",
+                            getattr(failed, "filepath", "unknown"),
+                            failed.error,
+                            total_frames,
+                        )
+                        self.device_disconnected = True
+                        break
                     detail = failed.error or "stopped unexpectedly"
                     raise Exception(f"Recorder error: {detail}")
-            
+
             # 3. Stop Recording
             stop_started = time.perf_counter()
             for r in self.recorders:
-                r.stop()
-                if r.error:
+                try:
+                    r.stop()
+                except Exception:
+                    pass
+                if r.error and not self.device_disconnected:
                     raise Exception(f"Recorder error: {r.error}")
             logger.info(
                 "Input streams stopped in %.3fs", time.perf_counter() - stop_started
             )
+            if self.audio is not None:
+                try:
+                    self.audio.terminate()
+                except Exception:
+                    logger.exception("Failed to terminate audio backend")
+                self.audio = None
+            self._notify_capture_stopped()
 
             # 4. Finalize
             if not self.recording_folder:
                 raise RuntimeError("Recording output folder was not created")
             self.final_filepath = _unique_output_path(
-                self.recording_folder, self.output_format, prefix="Merged"
+                self.recording_folder, self.output_format, prefix="Recording"
             )
 
-            if len(self.temp_files) == 2:
-                if not self.normalize:
-                    mix_started = time.perf_counter()
-                    if self.output_format == "mp3":
-                        self._mix_audio_to_mp3(
-                            self.temp_files[0], self.temp_files[1], self.final_filepath
-                        )
-                    else:
-                        self._mix_audio(
-                            self.temp_files[0], self.temp_files[1], self.final_filepath
-                        )
-                    logger.info(
-                        "Mixed and finalized both tracks in %.3fs",
-                        time.perf_counter() - mix_started,
-                    )
-                    return
+            existing_temp = [t for t in self.temp_files if os.path.exists(t)]
+            if not existing_temp:
+                raise RuntimeError("No audio recordings were captured.")
 
-                descriptor, mixed_wav = tempfile.mkstemp(suffix=".wav")
-                os.close(descriptor)
+            if len(existing_temp) == 2:
                 mix_started = time.perf_counter()
-                self._mix_audio(self.temp_files[0], self.temp_files[1], mixed_wav)
-                source_wav = mixed_wav
-                self.temp_files.append(mixed_wav)
-                logger.info("Mixed both tracks in %.3fs", time.perf_counter() - mix_started)
+                if self.output_format == "mp3":
+                    self._mix_audio_to_mp3(
+                        existing_temp[0], existing_temp[1], self.final_filepath
+                    )
+                else:
+                    self._mix_audio(
+                        existing_temp[0], existing_temp[1], self.final_filepath
+                    )
+                logger.info(
+                    "Mixed and finalized both tracks in %.3fs",
+                    time.perf_counter() - mix_started,
+                )
+                return
             else:
-                source_wav = self.temp_files[0]
-
-            # 5. Normalization
-            if self.normalize:
-                self._normalize_audio(source_wav)
+                source_wav = existing_temp[0]
 
             if self.output_format == "mp3":
                 self._convert_to_mp3(source_wav, self.final_filepath)
@@ -428,6 +724,7 @@ class AudioRecorder(threading.Thread):
             logger.exception("Error during recording process")
         finally:
             self.recording = False
+            self._notify_capture_stopped()
             for recorder in self.recorders:
                 if recorder.is_alive():
                     try:
@@ -459,8 +756,23 @@ class AudioRecorder(threading.Thread):
             if self.callback:
                 self.callback(self.final_filepath, self.error_message)
 
-    def _create_raw_recorder(self, device, filepath):
-        recorder = RawRecorder(device, filepath)
+    def _notify_capture_stopped(self):
+        if not self._capture_stopped_notified:
+            self._capture_stopped_notified = True
+            self.is_capturing = False
+            if self.on_capture_stopped_callback:
+                try:
+                    self.on_capture_stopped_callback()
+                except Exception:
+                    logger.exception("Error in on_capture_stopped_callback")
+
+    def _create_raw_recorder(self, device, filepath, source_name):
+        recorder = RawRecorder(
+            device,
+            filepath,
+            source_name=source_name,
+            levels_callback=self.on_levels_callback,
+        )
         recorder.audio = self.audio
         return recorder
 
@@ -481,18 +793,12 @@ class AudioRecorder(threading.Thread):
         return source_files
 
     def _finalize_source_files(self, source_files):
-        if self.output_format != "mp3" or self.keep_source_wav:
-            if self.output_format == "mp3" and self.keep_source_wav:
-                logger.info("Keeping original WAV source recordings")
-            return
-
         started = time.perf_counter()
         for source_wav in source_files:
-            source_mp3 = os.path.splitext(source_wav)[0] + ".mp3"
-            self._convert_to_mp3(source_wav, source_mp3)
-            os.remove(source_wav)
+            if os.path.exists(source_wav):
+                os.remove(source_wav)
         logger.info(
-            "Source recordings converted to MP3 in %.3fs",
+            "Source recordings removed after finalization in %.3fs",
             time.perf_counter() - started,
         )
 
@@ -510,51 +816,6 @@ class AudioRecorder(threading.Thread):
         ) as output:
             for mixed_block in self._iter_mixed_audio_blocks(file1, file2):
                 output.write(mixed_block)
-
-    def _normalize_audio(self, filepath):
-        started = time.perf_counter()
-        normalized_path = None
-        try:
-            with sf.SoundFile(filepath, mode="r") as source:
-                max_val = 0.0
-                for block in source.blocks(
-                    blocksize=PROCESSING_BLOCK_FRAMES,
-                    dtype="float32",
-                    always_2d=True,
-                ):
-                    if len(block):
-                        max_val = max(max_val, float(np.max(np.abs(block))))
-                if max_val == 0:
-                    logger.info("Normalization skipped for silent recording")
-                    return
-                samplerate = source.samplerate
-                channels = source.channels
-                subtype = source.subtype
-
-            descriptor, normalized_path = tempfile.mkstemp(suffix=".wav")
-            os.close(descriptor)
-            factor = 0.99 / max_val
-            with sf.SoundFile(filepath, mode="r") as source, sf.SoundFile(
-                normalized_path,
-                mode="w",
-                samplerate=samplerate,
-                channels=channels,
-                subtype=subtype,
-            ) as output:
-                for block in source.blocks(
-                    blocksize=PROCESSING_BLOCK_FRAMES,
-                    dtype="float32",
-                    always_2d=True,
-                ):
-                    output.write(block * factor)
-            os.replace(normalized_path, filepath)
-            normalized_path = None
-            logger.info("Normalization completed in %.3fs", time.perf_counter() - started)
-        except Exception:
-            logger.exception("Normalization failed for %s", filepath)
-        finally:
-            if normalized_path and os.path.exists(normalized_path):
-                os.remove(normalized_path)
 
     def _convert_to_mp3(self, src_wav, dst_mp3):
         started = time.perf_counter()

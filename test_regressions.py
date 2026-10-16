@@ -360,6 +360,195 @@ class RegressionTests(unittest.TestCase):
         source = Path("gui.py").read_text(encoding="utf-8")
         self.assertIn("self.settings_window.refresh_devices(preserve_selection=True)", source)
 
+    def test_mid_recording_device_disconnection_finalizes_cleanly(self):
+        class DisconnectingRecorder:
+            def __init__(self, device, filepath, **_):
+                self.device = device
+                self.filepath = filepath
+                self.error = "Unanticipated host error"
+                self.device_disconnected = True
+                self.frames_written = 44100
+                self.finished_event = threading.Event()
+                self.stop_event = threading.Event()
+
+            def start(self):
+                import soundfile as sf
+                import numpy as np
+                sf.write(self.filepath, np.zeros((100, 2), dtype=np.float32), 44100)
+                self.finished_event.set()
+
+            def is_alive(self):
+                return False
+
+            def stop(self):
+                self.stop_event.set()
+
+        callback_results = []
+        with tempfile.TemporaryDirectory() as folder:
+            recorder = audio_recorder.AudioRecorder(
+                mic_id=1,
+                source_mode="mic",
+                output_folder=folder,
+                output_format="wav",
+                on_finish_callback=lambda path, error: callback_results.append((path, error)),
+            )
+            recorder._get_device = lambda is_loopback: {"index": 1, "name": "Fake Mic"}
+
+            with patch.object(audio_recorder, "RawRecorder", DisconnectingRecorder):
+                recorder.run()
+
+            self.assertTrue(recorder.device_disconnected)
+            self.assertIsNone(recorder.error_message)
+            self.assertEqual(len(callback_results), 1)
+            final_path, err = callback_results[0]
+            self.assertIsNone(err)
+            self.assertTrue(os.path.exists(final_path))
+
+    def test_gui_implements_device_disconnection_resume(self):
+        source = Path("gui.py").read_text(encoding="utf-8")
+        self.assertIn("_resume_recording_after_device_change", source)
+        self.assertIn("was_device_change", source)
+        self.assertIn("device_disconnected", source)
+
+    def test_audio_recorder_notifies_capture_stopped_before_postprocessing(self):
+        events = []
+
+        class DummyRawRecorder:
+            def __init__(self, device, filepath, **_):
+                self.error = None
+                self.device_disconnected = False
+
+            def start(self):
+                events.append("raw_start")
+
+            def stop(self):
+                events.append("raw_stop")
+
+            def is_alive(self):
+                return False
+
+        with tempfile.TemporaryDirectory() as folder:
+            rec = audio_recorder.AudioRecorder(
+                mic_id=1,
+                source_mode="mic",
+                output_folder=folder,
+                output_format="wav",
+                on_capture_stopped_callback=lambda: events.append("capture_stopped"),
+                on_finish_callback=lambda path, err: events.append("finish_callback"),
+            )
+            rec._get_device = lambda is_loopback: {"index": 1, "name": "Fake"}
+            # create the expected partial file so finalize succeeds
+            def fake_create_raw(device, filepath):
+                import soundfile as sf
+                import numpy as np
+                sf.write(filepath, np.zeros((100, 1), dtype=np.float32), 44100)
+                return DummyRawRecorder(device, filepath)
+
+            rec._create_raw_recorder = fake_create_raw
+            rec.stop_event.set()
+
+            with patch.object(audio_recorder.pyaudio, "PyAudio"):
+                rec.run()
+
+            self.assertIn("raw_stop", events)
+            self.assertIn("capture_stopped", events)
+            self.assertIn("finish_callback", events)
+            # capture_stopped must occur after raw_stop and before finish_callback
+            raw_stop_idx = events.index("raw_stop")
+            cap_stop_idx = events.index("capture_stopped")
+            finish_idx = events.index("finish_callback")
+            self.assertGreater(cap_stop_idx, raw_stop_idx)
+            self.assertGreater(finish_idx, cap_stop_idx)
+
+    def test_gui_supports_starting_new_recording_while_previous_is_saving(self):
+        import gui
+
+        app = gui.TrayApplication.__new__(gui.TrayApplication)
+        app.recorder = None
+        app.saving_recorders = set()
+        app.last_mode = "mic"
+        app.icon_idle_path = "icon_idle.png"
+        app.icon_rec_path = "icon_rec.png"
+
+        class DummyAction:
+            def __init__(self):
+                self.enabled = False
+
+            def setEnabled(self, val):
+                self.enabled = val
+
+        class DummyTrayIcon:
+            def __init__(self):
+                self.icon = None
+                self.tooltip = ""
+                self.messages = []
+
+            def setIcon(self, icon):
+                self.icon = icon
+
+            def setToolTip(self, text):
+                self.tooltip = text
+
+            def showMessage(self, *args):
+                self.messages.append(args)
+
+        app.action_record_mic = DummyAction()
+        app.action_record_loop = DummyAction()
+        app.action_record_both = DummyAction()
+        app.action_stop = DummyAction()
+        app.tray_icon = DummyTrayIcon()
+        app.settings_window = types.SimpleNamespace(
+            get_settings=lambda: {"clipboard": False, "delete_after": False}
+        )
+
+        with patch.object(gui, "QIcon", lambda path: path):
+            # 1. Start recording 1
+            class FakeRecorder:
+                def __init__(self, name):
+                    self.name = name
+                    self.is_capturing = True
+                    self.device_disconnected = False
+
+                def is_alive(self):
+                    return True
+
+            rec1 = FakeRecorder("rec1")
+            app.recorder = rec1
+            self.assertTrue(app.is_recording())
+
+            # 2. Stop capture on recording 1 (postprocessing begins)
+            app.on_capture_finished(rec1)
+            self.assertFalse(app.is_recording())
+            self.assertIn(rec1, app.saving_recorders)
+            self.assertTrue(app.action_record_mic.enabled)
+            self.assertTrue(app.action_record_loop.enabled)
+            self.assertTrue(app.action_record_both.enabled)
+            self.assertFalse(app.action_stop.enabled)
+
+            # 3. User immediately starts recording 2 while rec1 is saving
+            rec2 = FakeRecorder("rec2")
+            app.recorder = rec2
+            self.assertTrue(app.is_recording())
+
+            # 4. rec1 finishes saving in the background
+            app.on_recording_finished("/path/to/rec1.wav", None, rec1)
+            self.assertNotIn(rec1, app.saving_recorders)
+            # rec2 is still recording! State must remain recording
+            self.assertTrue(app.is_recording())
+            self.assertIn("Recording", app.tray_icon.tooltip)
+
+            # 5. Stop capture on recording 2
+            app.on_capture_finished(rec2)
+            self.assertFalse(app.is_recording())
+            self.assertIn(rec2, app.saving_recorders)
+
+            # 6. rec2 finishes saving
+            app.on_recording_finished("/path/to/rec2.wav", None, rec2)
+            self.assertNotIn(rec2, app.saving_recorders)
+            self.assertFalse(app.is_recording())
+            self.assertIn("Idle", app.tray_icon.tooltip)
+
 
 if __name__ == "__main__":
     unittest.main()
+
