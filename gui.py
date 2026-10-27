@@ -3,11 +3,11 @@ import os
 import json
 import logging
 import threading
-import time
 from PyQt6.QtWidgets import (QApplication, QSystemTrayIcon, QMenu, QMainWindow,
                              QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox,
                              QPushButton, QFileDialog, QMessageBox, QGroupBox, 
-                             QLineEdit, QFormLayout, QSizePolicy)
+                             QLineEdit, QFormLayout, QSizePolicy, QDialog,
+                             QDialogButtonBox, QGridLayout)
 from PyQt6.QtGui import (QIcon, QAction, QColor, QPixmap, QPainter, QBrush,
                          QKeySequence, QPen, QLinearGradient, QActionGroup)
 from PyQt6.QtCore import pyqtSignal, QObject, Qt, QUrl, QMimeData, QDir, QTimer, QRectF
@@ -16,8 +16,6 @@ import numpy as np
 from audio_recorder import (
     AudioRecorder,
     AudioMonitorThread,
-    get_default_device_id,
-    get_default_loopback_device_id,
     get_devices,
     play_test_sound,
 )
@@ -37,6 +35,7 @@ class SignalManager(QObject):
     recording_finished = pyqtSignal(str, str, object)
     capture_finished = pyqtSignal(object)
     recording_levels = pyqtSignal(str, list, float)
+    recording_device_error = pyqtSignal(str, str)
     recording_start_requested = pyqtSignal(str)
     recording_stop_requested = pyqtSignal()
 
@@ -255,6 +254,146 @@ class AudioSpectrumWidget(QWidget):
                 painter.drawRect(QRectF(x, peak_y, bar_w, 1.5))
 
 
+class RecordingDeviceDialog(QDialog):
+    def __init__(
+        self,
+        mode,
+        mic_id,
+        mic_name,
+        loopback_id,
+        loopback_name,
+        parent=None,
+        validation_error=None,
+    ):
+        super().__init__(parent)
+        self.mode = mode
+        self._mic_id = mic_id
+        self._mic_name = mic_name
+        self._loopback_id = loopback_id
+        self._loopback_name = loopback_name
+        self.setWindowTitle("Confirm recording devices")
+        self.setModal(True)
+
+        layout = QVBoxLayout(self)
+        grid = QGridLayout()
+        grid.addWidget(QLabel("Microphone input:"), 0, 0)
+        self.combo_mic = QComboBox()
+        grid.addWidget(self.combo_mic, 0, 1)
+        grid.addWidget(QLabel("System audio output:"), 1, 0)
+        self.combo_loopback = QComboBox()
+        grid.addWidget(self.combo_loopback, 1, 1)
+        layout.addLayout(grid)
+
+        self.status_label = QLabel()
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+
+        refresh = QPushButton("Refresh devices")
+        refresh.clicked.connect(self.refresh_devices)
+        layout.addWidget(refresh)
+
+        self.buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        self.buttons.accepted.connect(self._accept_if_valid)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
+
+        self.combo_mic.currentIndexChanged.connect(self._selection_changed)
+        self.combo_loopback.currentIndexChanged.connect(self._selection_changed)
+        self.refresh_devices()
+        if validation_error:
+            self.status_label.setText(validation_error)
+
+    def refresh_devices(self):
+        self._remember_selection()
+        self.combo_mic.blockSignals(True)
+        self.combo_loopback.blockSignals(True)
+        self.combo_mic.clear()
+        self.combo_loopback.clear()
+        try:
+            mics = get_devices(include_loopback=False)
+            loopbacks = get_devices(include_loopback=True)
+            self._populate_combo(
+                self.combo_mic,
+                mics,
+                self._mic_id,
+                self._mic_name,
+                "No microphone available",
+            )
+            self._populate_combo(
+                self.combo_loopback,
+                loopbacks,
+                self._loopback_id,
+                self._loopback_name,
+                "No system-audio output available",
+            )
+        except Exception as error:
+            logger.exception("Error refreshing recording devices")
+            self.combo_mic.addItem("Unable to list microphones")
+            self.combo_loopback.addItem("Unable to list system-audio outputs")
+            self.status_label.setText(f"Unable to refresh devices: {error}")
+        finally:
+            self.combo_mic.blockSignals(False)
+            self.combo_loopback.blockSignals(False)
+
+        mic_required = self.mode in ("mic", "both")
+        loopback_required = self.mode in ("loopback", "both")
+        self.combo_mic.setEnabled(mic_required)
+        self.combo_loopback.setEnabled(loopback_required)
+        self._update_validation()
+
+    @staticmethod
+    def _populate_combo(combo, devices, selected_id, selected_name, empty_text):
+        for device in devices:
+            combo.addItem(device["name"], device["id"])
+        selected_index = -1
+        if selected_id is not None:
+            selected_index = combo.findData(selected_id)
+        if selected_index >= 0:
+            combo.setCurrentIndex(selected_index)
+        elif not devices:
+            combo.addItem(empty_text, None)
+        else:
+            combo.setCurrentIndex(-1)
+
+    def _remember_selection(self):
+        if self.combo_mic.currentData() is not None:
+            self._mic_id = self.combo_mic.currentData()
+            self._mic_name = self.combo_mic.currentText()
+        if self.combo_loopback.currentData() is not None:
+            self._loopback_id = self.combo_loopback.currentData()
+            self._loopback_name = self.combo_loopback.currentText()
+
+    def _selection_changed(self, _index):
+        self._remember_selection()
+        self._update_validation()
+
+    def _update_validation(self):
+        missing = []
+        if self.mode in ("mic", "both") and self.combo_mic.currentData() is None:
+            missing.append("microphone input")
+        if self.mode in ("loopback", "both") and self.combo_loopback.currentData() is None:
+            missing.append("system-audio output")
+        if missing:
+            self.status_label.setText(
+                "Select an available " + " and ".join(missing) + " before confirming."
+            )
+        elif not self.status_label.text().startswith("Unable to"):
+            self.status_label.setText("Confirm the devices for this recording.")
+        self.buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(not missing)
+
+    def _accept_if_valid(self):
+        self._remember_selection()
+        if self.buttons.button(QDialogButtonBox.StandardButton.Ok).isEnabled():
+            self.accept()
+
+    def selected_devices(self):
+        self._remember_selection()
+        return self._mic_id, self._loopback_id
+
+
 class SettingsWindow(QMainWindow):
     settings_saved = pyqtSignal()
     device_selection_changed = pyqtSignal(str)
@@ -417,10 +556,7 @@ class SettingsWindow(QMainWindow):
             self.stop_microphone_test()
 
         prev_mic_id = self.combo_mic.currentData() if preserve_selection else None
-        prev_mic_name = self.combo_mic.currentText() if preserve_selection else None
-
         prev_loop_id = self.combo_loopback.currentData() if preserve_selection else None
-        prev_loop_name = self.combo_loopback.currentText() if preserve_selection else None
 
         self.combo_mic.blockSignals(True)
         self.combo_loopback.blockSignals(True)
@@ -429,40 +565,24 @@ class SettingsWindow(QMainWindow):
         try:
             mics = get_devices(include_loopback=False)
             loopbacks = get_devices(include_loopback=True)
-            default_mic_id = get_default_device_id()
-            default_loopback_id = get_default_loopback_device_id()
 
             mic_index_to_select = -1
-            default_mic_index = 0
             for i, m in enumerate(mics):
                 self.combo_mic.addItem(f"{m['name']}", m['id'])
-                if prev_mic_name and m['name'] == prev_mic_name:
+                if prev_mic_id is not None and m['id'] == prev_mic_id:
                     mic_index_to_select = i
-                elif mic_index_to_select == -1 and prev_mic_id is not None and m['id'] == prev_mic_id:
-                    mic_index_to_select = i
-                if m['id'] == default_mic_id:
-                    default_mic_index = i
 
             if mic_index_to_select >= 0:
                 self.combo_mic.setCurrentIndex(mic_index_to_select)
-            elif len(mics) > 0:
-                self.combo_mic.setCurrentIndex(default_mic_index)
 
             loop_index_to_select = -1
-            default_loopback_index = 0
             for i, device in enumerate(loopbacks):
                 self.combo_loopback.addItem(device["name"], device["id"])
-                if prev_loop_name and device["name"] == prev_loop_name:
+                if prev_loop_id is not None and device["id"] == prev_loop_id:
                     loop_index_to_select = i
-                elif loop_index_to_select == -1 and prev_loop_id is not None and device["id"] == prev_loop_id:
-                    loop_index_to_select = i
-                if device["id"] == default_loopback_id:
-                    default_loopback_index = i
 
             if loop_index_to_select >= 0:
                 self.combo_loopback.setCurrentIndex(loop_index_to_select)
-            elif len(loopbacks) > 0:
-                self.combo_loopback.setCurrentIndex(default_loopback_index)
 
         except Exception as e:
             logger.exception("Error refreshing devices")
@@ -492,31 +612,13 @@ class SettingsWindow(QMainWindow):
                 if fmt_idx >= 0: self.combo_fmt.setCurrentIndex(fmt_idx)
                 
                 saved_id = data.get("device_id")
-                saved_name = data.get("device_name")
-                if saved_name:
-                    idx = self.combo_mic.findText(saved_name)
-                    if idx >= 0:
-                        self.combo_mic.setCurrentIndex(idx)
-                    elif saved_id is not None:
-                        idx = self.combo_mic.findData(saved_id)
-                        if idx >= 0:
-                            self.combo_mic.setCurrentIndex(idx)
-                elif saved_id is not None:
+                if saved_id is not None:
                     idx = self.combo_mic.findData(saved_id)
                     if idx >= 0:
                         self.combo_mic.setCurrentIndex(idx)
 
                 saved_loopback_id = data.get("loopback_id")
-                saved_loopback_name = data.get("loopback_name")
-                if saved_loopback_name:
-                    idx = self.combo_loopback.findText(saved_loopback_name)
-                    if idx >= 0:
-                        self.combo_loopback.setCurrentIndex(idx)
-                    elif saved_loopback_id is not None:
-                        idx = self.combo_loopback.findData(saved_loopback_id)
-                        if idx >= 0:
-                            self.combo_loopback.setCurrentIndex(idx)
-                elif saved_loopback_id is not None:
+                if saved_loopback_id is not None:
                     idx = self.combo_loopback.findData(saved_loopback_id)
                     if idx >= 0:
                         self.combo_loopback.setCurrentIndex(idx)
@@ -580,6 +682,21 @@ class SettingsWindow(QMainWindow):
             idx = self.combo_loopback.findText(loopback_name)
             if idx >= 0:
                 self.combo_loopback.setCurrentIndex(idx)
+        self.save_settings(show_prompt=False)
+
+    def apply_recording_devices(self, mic_id, loopback_id):
+        self.combo_mic.blockSignals(True)
+        self.combo_loopback.blockSignals(True)
+        try:
+            mic_index = self.combo_mic.findData(mic_id)
+            loopback_index = self.combo_loopback.findData(loopback_id)
+            if mic_index >= 0:
+                self.combo_mic.setCurrentIndex(mic_index)
+            if loopback_index >= 0:
+                self.combo_loopback.setCurrentIndex(loopback_index)
+        finally:
+            self.combo_mic.blockSignals(False)
+            self.combo_loopback.blockSignals(False)
         self.save_settings(show_prompt=False)
 
     def _on_device_selection_changed(self, source_name):
@@ -667,8 +784,9 @@ class SettingsWindow(QMainWindow):
             monitor.stop()
         self.btn_test_mic.setText("Test Mic")
         self.btn_test_mic.setStyleSheet("")
-        self.spectrum_mic.set_active(False)
-        if not self.tray_app or not self.tray_app.is_recording():
+        is_recording = bool(self.tray_app and self.tray_app.is_recording())
+        if not is_recording:
+            self.spectrum_mic.set_active(False)
             self.lbl_spectrum_mic.setVisible(True)
             self.spectrum_mic.setVisible(True)
             self.lbl_spectrum_loopback.setVisible(True)
@@ -730,7 +848,8 @@ class SettingsWindow(QMainWindow):
 
     def closeEvent(self, event):
         self.stop_microphone_test()
-        self.stop_recording_levels()
+        if not self.tray_app or not self.tray_app.is_recording():
+            self.stop_recording_levels()
         super().closeEvent(event)
 
 
@@ -742,7 +861,6 @@ class TrayApplication(QObject):
         self.saving_recorders = set()
         self.hotkey_handles = []
         self.last_mode = "mic"
-        self._device_restart_timestamps = []
         
         self.signals = SignalManager()
         self.signals.recording_finished.connect(self.on_recording_finished)
@@ -766,6 +884,7 @@ class TrayApplication(QObject):
         self.signals.recording_levels.connect(
             self.settings_window.update_recording_levels
         )
+        self.signals.recording_device_error.connect(self.on_recording_device_error)
         configure_logging(self.settings_window.get_settings()["log_folder"])
         self.settings_window.settings_saved.connect(self.on_settings_saved)
 
@@ -913,6 +1032,14 @@ class TrayApplication(QObject):
         if not self.is_recording():
             return
         self.settings_window.save_settings(show_prompt=False)
+        if (
+            source_name == "Microphone"
+            and self.last_mode not in ("mic", "both")
+        ) or (
+            source_name == "SystemAudio"
+            and self.last_mode not in ("loopback", "both")
+        ):
+            return
         self.request_device_switch(source_name)
 
     @staticmethod
@@ -1011,21 +1138,11 @@ class TrayApplication(QObject):
         self.settings_window.activateWindow()
 
     def start_recording(self, mode="mic"):
-        if self.is_recording(): return
-        if self.settings_window:
-            self.settings_window.stop_microphone_test()
-            self.settings_window.refresh_devices(preserve_selection=True)
-            self.populate_device_menus()
-        self.last_mode = mode    
+        if self.is_recording():
+            return
+        self.settings_window.stop_microphone_test()
         settings = self.settings_window.get_settings()
-        target_id = settings['device_id']
-        target_loopback_id = settings['loopback_id']
-        logger.info(
-            "Starting recording request: mode=%s (mic_id=%s, loopback_id=%s)",
-            mode,
-            target_id,
-            target_loopback_id,
-        )
+        validation_error = None
         
         recorder_instance = None
 
@@ -1042,15 +1159,54 @@ class TrayApplication(QObject):
         def levels_callback(source_name, bands, rms):
             self.signals.recording_levels.emit(source_name, bands, rms)
 
-        recorder_instance = AudioRecorder(
-            mic_id=target_id,
-            source_mode=mode,
-            output_folder=settings['output_folder'],
-            output_format=settings['format'],
-            on_finish_callback=finish_callback,
-            on_capture_stopped_callback=capture_callback,
-            on_levels_callback=levels_callback,
-            loopback_id=target_loopback_id,
+        def source_error_callback(source_name, message):
+            self.signals.recording_device_error.emit(source_name, message)
+
+        while True:
+            dialog = RecordingDeviceDialog(
+                mode,
+                settings.get("device_id"),
+                settings.get("device_name"),
+                settings.get("loopback_id"),
+                settings.get("loopback_name"),
+                self.settings_window,
+                validation_error,
+            )
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+
+            target_id, target_loopback_id = dialog.selected_devices()
+            self.settings_window.apply_recording_devices(
+                target_id, target_loopback_id
+            )
+            settings = self.settings_window.get_settings()
+            recorder_instance = AudioRecorder(
+                mic_id=settings["device_id"],
+                source_mode=mode,
+                output_folder=settings["output_folder"],
+                output_format=settings["format"],
+                on_finish_callback=finish_callback,
+                on_capture_stopped_callback=capture_callback,
+                on_levels_callback=levels_callback,
+                on_source_error_callback=source_error_callback,
+                loopback_id=settings["loopback_id"],
+            )
+            try:
+                recorder_instance.validate_devices()
+            except Exception as error:
+                validation_error = (
+                    "The selected device is no longer available. "
+                    f"Choose another device: {error}"
+                )
+                continue
+            break
+
+        self.last_mode = mode
+        logger.info(
+            "Starting recording request: mode=%s (mic_id=%s, loopback_id=%s)",
+            mode,
+            settings["device_id"],
+            settings["loopback_id"],
         )
         self.recorder = recorder_instance
         self.settings_window.start_recording_levels(mode)
@@ -1131,11 +1287,6 @@ class TrayApplication(QObject):
         if self.recorder is rec:
             self.recorder = None
 
-        target_recorder = rec or self.recorder
-        was_device_change = bool(
-            target_recorder and getattr(target_recorder, "device_disconnected", False)
-        )
-        previous_mode = self.last_mode
         if not self.is_recording():
             self.action_record_mic.setEnabled(True)
             self.action_record_loop.setEnabled(True)
@@ -1153,13 +1304,10 @@ class TrayApplication(QObject):
             self.tray_icon.setIcon(QIcon(self.icon_rec_path))
             self.tray_icon.setToolTip(f"Recording ({self.last_mode})...")
 
-        if error and not was_device_change:
+        if error:
             logger.error("Recording failed: %s", error)
             self.tray_icon.showMessage("Error", f"Recording failed: {error}", QSystemTrayIcon.MessageIcon.Critical, 4000)
             return
-
-        if error and was_device_change:
-            logger.warning("Device disconnected mid-recording with error: %s", error)
             
         msg = ""
         if path and os.path.exists(path):
@@ -1168,42 +1316,16 @@ class TrayApplication(QObject):
 
             logger.info("Recording segment saved: %s", path)
 
-        if was_device_change:
-            logger.info("Device change detected. Scheduling auto-resume for mode '%s'...", previous_mode)
-            self.tray_icon.showMessage(
-                "Device Changed",
-                "Dispositivo modificato. Registrazione salvata, riavvio in corso...",
-                QSystemTrayIcon.MessageIcon.Information,
-                2500,
-            )
-            QTimer.singleShot(700, lambda: self._resume_recording_after_device_change(previous_mode))
-            return
-
         self.tray_icon.showMessage("Finished", msg, QSystemTrayIcon.MessageIcon.Information, 2000)
 
-    def _resume_recording_after_device_change(self, mode):
-        now = time.time()
-        self._device_restart_timestamps = [
-            t for t in self._device_restart_timestamps if now - t < 15.0
-        ]
-        if len(self._device_restart_timestamps) >= 4:
-            logger.warning(
-                "Device restart threshold reached (4 in 15s). Aborting auto-resume."
-            )
-            self.tray_icon.showMessage(
-                "Auto-Resume Stopped",
-                "Troppi cambi di dispositivo rilevati in rapida successione. Registrazione interrotta.",
-                QSystemTrayIcon.MessageIcon.Warning,
-                4000,
-            )
-            return
-
-        self._device_restart_timestamps.append(now)
-        logger.info("Auto-resuming recording in mode '%s' after device change", mode)
-        if self.settings_window:
-            self.settings_window.refresh_devices(preserve_selection=True)
-            self.populate_device_menus()
-        self.start_recording(mode)
+    def on_recording_device_error(self, source_name, message):
+        logger.warning("%s capture is unavailable: %s", source_name, message)
+        self.tray_icon.showMessage(
+            f"{source_name} unavailable",
+            f"{message}\nSelect another device manually.",
+            QSystemTrayIcon.MessageIcon.Warning,
+            4000,
+        )
 
     def exit_app(self):
         logger.info("Application exiting")
