@@ -279,49 +279,24 @@ class RawRecorder(threading.Thread):
                             "input": True,
                             "input_device_index": int(current_device["index"]),
                         }
-                        use_callback = bool(current_device.get("isLoopbackDevice"))
-                        if use_callback:
-                            stream_args["stream_callback"] = callback
+                        stream_args["stream_callback"] = callback
                         stream = audio.open(**stream_args)
                         self.error = None
                         self.device_disconnected = False
-                        if use_callback:
-                            while not self.stop_event.wait(0.1):
-                                if self._switch_event.is_set():
-                                    break
-                                try:
-                                    if not stream.is_active():
-                                        self._stream_error = "The audio stream became inactive."
-                                        logger.warning(
-                                            "Stream became inactive for %s",
-                                            self.filepath,
-                                        )
-                                        break
-                                except Exception:
-                                    self._stream_error = "The audio stream could not be checked."
-                                    break
-                        else:
-                            while not self.stop_event.is_set():
-                                if self._switch_event.is_set():
-                                    break
-                                try:
-                                    raw_data = stream.read(
-                                        2048, exception_on_overflow=False
-                                    )
-                                except Exception as read_err:
-                                    self._stream_error = f"{type(read_err).__name__}: {read_err}".rstrip()
+                        while not self.stop_event.wait(0.1):
+                            if self._switch_event.is_set():
+                                break
+                            try:
+                                if not stream.is_active():
+                                    self._stream_error = "The audio stream became inactive."
                                     logger.warning(
-                                        "Stream read failed (device disconnected?) for %s: %s",
+                                        "Stream became inactive for %s",
                                         self.filepath,
-                                        read_err,
                                     )
                                     break
-                                data = np.frombuffer(raw_data, dtype=np.int16)
-                                if channels > 1:
-                                    data = data.reshape(-1, channels)
-                                data = data.astype(np.float32) / 32768.0
-                                write_data(data)
-                                self._notify_levels(data, samplerate)
+                            except Exception:
+                                self._stream_error = "The audio stream could not be checked."
+                                break
                     except Exception as error:
                         self._stream_error = f"{type(error).__name__}: {error}".rstrip()
                         logger.exception("Audio stream failed for %s", self.filepath)
@@ -423,10 +398,10 @@ class RawRecorder(threading.Thread):
             except Exception:
                 logger.exception("Audio source error callback failed")
 
-    def stop(self):
+    def stop(self, timeout=1.5):
         self.stop_event.set()
         self._switch_event.set()
-        self.join()
+        self.join(timeout=timeout)
 
     def _probe_params(
         self,
